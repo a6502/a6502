@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Managing PostgreSQL stored procedures</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <style type="text/css">
+      
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      /*
+      @font-face{
+        font-family: 'Droid Serif';
+        src: url('DroidSerif-Regular.ttf');
+      }
+      @font-face{
+        font-family: 'Yanone Kaffeesatz';
+        src: url('YanoneKaffeesatz-Regular.ttf');
+      }
+      @font-face{
+        font-family: 'Ubuntu Mono';
+        src: url('UbuntuMono-Regular.ttf');
+      }
+      */
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .footnote {
+        position: absolute;
+        bottom: 3em;
+      }
+      ul { margin-top: 0; }
+      li { line-height: 1.50em; }
+      p { line-height: 1.25em; }
+      .nomargin p { margin-bottom: 0; }
+      .red { color: #fa0000; }
+      .large { font-size: 2em; }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+class: center, middle
+# Managing PostgreSQL stored procedures
+# as application code
+Wieger Opmeer
+
+(opmeer@strato.de)
+.footnote[TPC Glasgow 2018]
+
+???
+
+---
+
+# Why use stored procedures?
+
+- no round trip time
+  - especially useful if you have to "piece together" your data
+- work with the database-native data-types
+  - jsonb
+- can be used to create a API-layer in the database
+  - low overhead
+  - known protocol
+     - if you're already talking to the database
+
+
+
+---
+
+# Disadvantages of stored procedures
+
+- they're "hidden in the database"
+  - especially if you're not familiar with the database tooling
+- difficult to manage
+
+
+---
+
+# Database Schema Management: Migrations
+
+_the somewhat standard way_
+
+- have migrations steps:
+  - for one version up do this
+     - alter table foo add column bar text
+     - create index foo_bar_idx on foo(bar)
+  - for one version down do that
+     - alter table foo drop column bar
+     - drop index foo_bar_idx
+
+- crappy way to manage stored procedures
+  - if stored procedures are part of your application
+  - because code changes more rapidly than the schema
+
+---
+
+## Example: Mojo::Pg::Migrations
+
+* Allows database schemas to evolve easily over time
+* Uses 'migration files':
+    * just a collection of sql statements
+    * separated by comments of the form -- VERSION UP/DOWN
+* Lets you migrate from any version to any version, up or down, in small
+  steps
+* Migrations are performed in transactions
+    * 'Transactional DDL' is a PostgreSQL feature
+* Locking is used to prevent multiple migrations running at the same time
+    * important for the auto_migrate feature
+* The current version is stored in the automatically created table
+  'mojo_migrations'
+
+---
+
+## Example
+
+(From perldoc Mojo::Pg::Migrations)
+
+```sql
+
+-- 1 up
+create table messages (message text);
+insert into messages values ('I ♥ Mojolicious!');
+-- 1 down
+drop table messages;
+
+-- 2 up (...you can comment freely here...)
+create table stuff (whatever int);
+-- 2 down
+drop table stuff;
+
+
+```
+
+```
+$db->migrations->from_file('migrations.sql')->migrate;
+
+```
+
+---
+
+# Introducing: &lsquo;dbdings&rsquo;
+
+"do something sensible with the database"
+
+Why 'dbdings'?
+
+* because we wanted to be able to version control stored procedures
+    * one .sql file per stored procedure
+        * so git/cvs can track version history nicely
+    * 'standard' Edit-Compile-Run cycle
+        * 'compile' -> 'load stored procedure'
+* because the existing open source (Perl) database migration solutions
+  that I could find do not have special handling of stored procedures
+    * every change to a stored procedure is a schema upgrade
+    * not a single file per procedure
+* because I wanted something small and simple (KISS)
+
+---
+
+## How dbdings works (migration)
+
+* on disk db/schema/.version contains the 'should' version
+* in the database table _schema contains the 'is' version
+* to go from version N to N+1 (upgrade):
+    * execute db/schema/v{N+1}/alter.sql to upgrade
+    * execute db/schema/v{N+1}/verify.sql to do checks
+* to go from version N to N-1 (downgrade):
+    * execute db/schema/v{N}/downgrade.sql to upgrade
+    * execute db/schema/v{N-1}/verify.sql to do checks
+* both scripts are executed in 1 transaction
+    * using PostgreSQL's transactional DDL    
+* dbdings can also create the schema from scratch
+    * I'll skip over the details for now
+
+---
+
+## Example
+
+db/schema/v8/alter.sql:
+
+```sql
+alter table jobs add column current_depth integer
+    not null default 1;
+
+alter table jobs_archive add column current_depth integer;
+```
+
+db/schema/v8/downgrade.sql:
+```sql
+alter table jobs drop column current_depth;
+
+alter table jobs_archive drop column current_depth;
+```
+
+---
+
+## Example cont'd
+
+db/schema/v8/verify.sql:
+```sql
+DO $BODY$
+BEGIN
+        ASSERT (SELECT EXISTS(
+                SELECT
+                        true
+                FROM
+                        information_schema.columns
+                WHERE
+                        table_schema='jobcenter'
+                        AND table_name='jobs'
+                        AND column_name='current_depth'
+        )), 'no column current_depth in table jobs??';
+        ASSERT (SELECT EXISTS(
+                SELECT
+                        true
+                FROM
+                        information_schema.columns
+                WHERE
+                        table_schema='jobcenter'
+                        AND table_name='jobs_archive'
+                        AND column_name='current_depth'
+        )), 'no column current_depth in table jobs_archive?';
+        RAISE NOTICE 'all tests succesfull?';
+END
+$BODY$;
+```
+
+---
+
+## Schema commands
+
+* check:           check schema version in db and repo
+* create:          create schema in db
+* downgrade [ver]: try to downgrade db schema version to [ver]
+* upgrade:         try to upgrade db schema version to repo version
+* verify:          verify latest schema upgrade
+
+---
+
+## How dbdings works (stored procs)
+
+* db/procs/*.sql is the 'should' situation
+* table _procs contains the 'is' situation according to dbdings
+    * md5sum of the function code
+* 'dbding compare' detects
+    * procedure changed on disk (only)
+        * use 'dbdings load [proc]' to load into db
+        * use 'dbding update' to load all changed procedures
+    * procedure changed in db (only)
+        * maybe changed by psql's '\ef [proc]'.
+        * use 'dbdings save [proc]' to save to disk
+        * refuse to overwrite with 'update'
+        * may overwrite with 'load'
+    * procedure changed both on disk and in db
+        * panic!
+        * user needs to decide what needs to be done
+    
+
+---
+
+# Stored procedures commands
+
+* compare:         compare version between db and repo
+* load &lt;proc&gt;:     load &lt;proc&gt; from repo into db
+* save &lt;proc&gt;:     save &lt;proc&gt; from db to repo
+* update:          update procs in db from repo
+
+
+---
+
+## Possible enhancements
+
+* Current status 'It Works For Me' &trade;
+
+* Better integration with git?
+    * record git commit hash somewhere?
+    * 'downgrade' also downgrades checkout?
+    * do upgrades/downgrades 1 step at a time
+        * makes it easier to delete things
+
+* Locking like Mojo::Pg?
+    
+---
+
+## Possible future work
+
+* Turn it into a seperate standalone tool?
+
+* Support for other databases?
+    * Needs a way to do a md5sum of the proc in the db
+
+---
+
+# Questions? Suggestions?
+
+&lsquo;dbdings&rsquo; is part of the JobCenter:
+
+- https://github.com/a6502/jobcenter
+- https://gitlab.com/a6502/jobcenter
+
+(file db/dbdings)
+
+---
+class: center, middle
+# Thank You!
+
+
+    </textarea>
+    <!-- <script src="http://gnab.github.io/remark/downloads/remark-latest.min.js" type="text/javascript">  -->
+    <script src="remark.min.js" type="text/javascript">
+    </script>
+    <script type="text/javascript">
+      var slideshow = remark.create({
+        "highlightLines": true,
+        "highlightSpans": true,
+      });
+    </script>
+  </body>
+</html>
