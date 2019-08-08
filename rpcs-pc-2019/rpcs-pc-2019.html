@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>RPC-Switch: JSON-RPC service-composition</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <style type="text/css">
+      
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      /*
+      @font-face{
+        font-family: 'Droid Serif';
+        src: url('DroidSerif-Regular.ttf');
+      }
+      @font-face{
+        font-family: 'Yanone Kaffeesatz';
+        src: url('YanoneKaffeesatz-Regular.ttf');
+      }
+      @font-face{
+        font-family: 'Ubuntu Mono';
+        src: url('UbuntuMono-Regular.ttf');
+      }
+      */
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .footnote {
+        position: absolute;
+        bottom: 3em;
+      }
+      ul { margin-top: 0; }
+      li { line-height: 1.50em; }
+      p { line-height: 1.25em; }
+      .nomargin p { margin-bottom: 0; }
+      .red { color: #fa0000; }
+      .large { font-size: 2em; }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+class: center, middle
+# RPC-Switch:
+# JSON-RPC service-composition 
+Wieger Opmeer
+
+(opmeer@strato.de)
+.footnote[PerlCon Rīga 2019]
+
+???
+
+about me
+about strato?
+
+---
+
+## The problem:
+
+- lots of different systems by different departments
+- most of them need to talk to each other
+  - almost a fully connected mesh
+- using various protocols
+  - some home-grown
+
+---
+
+## The (beginning of a) solution:
+
+- try to migrate to one protocol
+- try to introduce "API aggregation points"
+  - a.k.a. service-composition
+
+---
+
+## What is service-composition?
+
+Piecing together various (micro)services to form a larger service.
+
+(Hopefully with a coherent API)
+
+---
+
+## TMTOWTDI
+
+- service discovery
+- middle man a.k.a. proxy a.k.a. API Gateway
+- etc.?
+
+---
+
+class: center, middle
+# RPC-Switch:
+# <strike>JSON-RPC service composition</strike>
+# JSON-RPC 2.0 API Gateway 
+
+---
+
+## <strike>API Gateway</strike>
+## <strike>Service Switchboard</strike>
+## RPC-Switch
+
+- Clients connect to the RPC-Switch and call methods
+- Workers connect to the RPC-Switch and 'announce' methods
+- A worker is a client
+- The RPC-Switch rewrites and forwards requests (methods calls)
+  - after checking ACL
+  - optionally after validating per request authentication  
+- The RPC-Switch forwards responses
+
+???
+
+Naming things is hard
+
+---
+
+## Twoway JSON-RPC 2.0 over 'NetstringStream'
+
+Long lived tcp or ssl connection with netstrings as a framing mechanism:
+
+```json
+86:{"jsonrpc":"2.0","params":{},"method":"rpcswitch.ping","id":"ZpnvECEhLRBpzTy9evMIuQ"},
+```
+
+- asynchronous
+
+- unlimited amount of requests 'in flight' on a single connection
+
+- overtaking allowed
+
+- both sides can send requests (or notifications)
+
+???
+
+- https://cr.yp.to/proto/netstrings.txt
+
+- https://www.jsonrpc.org/specification
+
+- MojoX::NetstringStream
+
+---
+
+## Request rewriting
+
+- method namespace mapping
+- add authentication information
+- add 'virtual channel' information
+
+---
+
+## Request rewriting example
+
+input from client:
+
+```json
+{
+  "id":"kYxd0/eZJkOm+Iu6kVNmZA",
+  "params":{"step":3,"counter":12},
+  "jsonrpc":"2.0",
+  "method":"foo.add"
+}
+```
+
+output to worker:
+
+```json
+{
+  "params":{"step":3,"counter":12},
+  "id":"kYxd0/eZJkOm+Iu6kVNmZA",
+  "method":"bar.add",
+  "rpcswitch":{"vcookie":"eatme","vci":"1734@12098<->2@12099","who":"theCustomer"},
+  "jsonrpc":"2.0"
+}
+```
+
+---
+
+## Response forwarding
+
+- The RPC-Switch looks at the virtual channel information
+- The worker (client) library needs to know about the extra information
+- Multiple responses are allowed
+  - The extra responses become notifications on the virtual channel
+
+
+---
+
+## Response example
+
+first response from worker:
+
+```json
+{
+  "id":"kYxd0/eZJkOm+Iu6kVNmZA",
+  "jsonrpc":"2.0",
+  "rpcswitch":{..."worker_id":"2@12099","vci":"1734@12098<->2@12099"},
+  "result":["RES_WAIT","kYxd0/eZJkOm+Iu6kVNmZA"]
+}
+```
+
+second response from worker:
+
+```json
+{
+  "method":"rpcswitch.result",
+  "params":["RES_OK","kYxd0/eZJkOm+Iu6kVNmZA",{"counter":15}],
+  "jsonrpc":"2.0",
+  "rpcswitch":{...,"worker_id":"2@12099","vci":"1734@12098<->2@12099"}
+}
+```
+
+---
+
+## Implementation details
+
+version 1
+- 1.5 kloc
+- based on Mojo::IOLoop::Server
+- single process
+- MojoX::NetstringStream
+- JSON::RPC2::TwoWay
+- RPC::Switch::Client
+  - a worker is a client
+  - and clients in c, js, java
+  - todo: python (real soon now), perl6
+  
+---
+
+## Implementation details cont'd
+
+version 2:
+- compatible to version 1
+- 3 kloc
+- now multiprocess
+- shares as litlle as possible between processes
+  - LMDB_File for shared information
+  - POSIX::RT::MQ for interprocess communication
+
+
+---
+
+## RPC-Switch pros and cons
+
+pro:
+- one well-known point to connect to
+- outgoing connections is easier with our admins
+- one place for the global configuration
+
+con:
+- one single point of failure (currently)
+- dependency on the RPC-Switch operators
+
+---
+# Questions?
+
+Find the &lsquo;RPC-Switch&rsquo; at:
+
+- https://github.com/a6502/rpc-switch
+- https://github.com/a6502/rpc-switch2
+
+---
+class: center, middle
+# Thank You!
+
+???
+
+Once upon a time there was this company
+
+started small, as a reseller
+
+and grew and grew
+more products
+more departments
+more systems
+
+and most of them need to talk to each other
+
+a fully connected mesh?
+or a mess?
+
+wouldn't it be nice if clients can connect to a switchboard and just 'dial' the service they want?
+
+the idea: a central service switchboard
+
+'workers' connect to the switchboard and announce methods
+
+the central switchboard configuration manages:
+- namespace mapping
+- authentication
+- access control (for clients and servers)
+- basic documentation (blame allocation)
+
+clients connect to the switchboard and call methods
+they don't care which worker is doing this
+
+Twoway JSON-RPC 2.0 over NetstringStream:
+- a long lived tcp or ssl connection
+- netstrings for framing
+- both sides may send requests
+
+This allows for:
+- multiple in-flight requests on the connection
+- overtaking is allowed
+- multiple responses (with a little trick)
+- i'll do this, i'll call you when it's done
+
+Virtual channels:
+so the workers now which client it is working for
+the rpcswitch 'enriches' the request with authentication information
+- per request
+
+    </textarea>
+    <!-- <script src="http://gnab.github.io/remark/downloads/remark-latest.min.js" type="text/javascript">  -->
+    <script src="remark.min.js" type="text/javascript">
+    </script>
+    <script type="text/javascript">
+      var slideshow = remark.create({
+        "highlightLines": true,
+        "highlightSpans": true,
+      });
+    </script>
+  </body>
+</html>
